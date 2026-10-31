@@ -26,22 +26,40 @@ jobs:
           Write-Host "::add-mask::$pass"
           "ANYDESK_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Baixar e iniciar o AnyDesk
+      - name: Instalar AnyDesk (com serviço)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $dir = Join-Path $env:RUNNER_TEMP 'anydesk'
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          $exe = Join-Path $dir 'AnyDesk.exe'
-          Invoke-WebRequest -Uri 'https://download.anydesk.com/AnyDesk.exe' -OutFile $exe -UseBasicParsing
+          choco install anydesk -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Falha na instalação do AnyDesk (código $LASTEXITCODE)." }
+
+          $exe = @(
+            'C:\Program Files (x86)\AnyDesk\AnyDesk.exe',
+            'C:\Program Files\AnyDesk\AnyDesk.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem 'C:\Program Files*' -Recurse -Filter AnyDesk.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $exe) { throw 'AnyDesk.exe não foi encontrado após a instalação.' }
+          Write-Host "AnyDesk em: $exe"
           "ANYDESK_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          Start-Process -FilePath $exe -WindowStyle Hidden
-          Start-Sleep -Seconds 10
+          # Garante que o serviço está rodando
+          $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
+          if ($svc -and $svc.Status -ne 'Running') { Start-Service AnyDesk }
+          Start-Sleep -Seconds 5
+          Get-Service -Name AnyDesk -ErrorAction SilentlyContinue | Format-List Name, Status
 
-          # Define a senha de acesso não supervisionado (enviada pela entrada padrão)
-          $env:ANYDESK_PASS | & $exe --set-password
-          if ($LASTEXITCODE -ne 0) { throw "Falha ao definir a senha do AnyDesk (código $LASTEXITCODE)." }
+      - name: Definir senha de acesso
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = $env:ANYDESK_PASS | & $env:ANYDESK_EXE --set-password 2>&1
+          $code = $LASTEXITCODE
+          Write-Host "Saída do --set-password: $out"
+          Write-Host "Código de saída: $code"
+          if ($code -ne 0) { throw "Falha ao definir a senha do AnyDesk (código $code). Saída: $out" }
           Write-Host 'Senha definida.'
 
       - name: Obter ID do AnyDesk
@@ -49,12 +67,15 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $id = $null
-          for ($i = 0; $i -lt 20; $i++) {
-            $out = (& $env:ANYDESK_EXE --get-id 2>$null | Out-String).Trim()
-            if ($out -match '^\d{9,10}$') { $id = $out; break }
+          for ($i = 0; $i -lt 30; $i++) {
+            $out = (& $env:ANYDESK_EXE --get-id 2>&1 | Out-String).Trim()
+            if ($out -match '(\d{9,10})') { $id = $Matches[1]; break }
             Start-Sleep -Seconds 3
           }
-          if (-not $id) { throw 'Não foi possível obter o ID do AnyDesk.' }
+          if (-not $id) {
+            Write-Host "Última saída do --get-id: $out"
+            throw 'Não foi possível obter o ID do AnyDesk.'
+          }
           Write-Host "::add-mask::$id"
           "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
@@ -84,10 +105,10 @@ jobs:
           $count = 0
           while ($true) {
             $count++
-            if (-not (Get-Process -Name AnyDesk -ErrorAction SilentlyContinue)) {
-              Write-Host '::error::O AnyDesk parou. Reiniciando...'
-              Start-Process -FilePath $env:ANYDESK_EXE -WindowStyle Hidden
-              Start-Sleep -Seconds 10
+            $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne 'Running') {
+              Write-Host '::warning::Serviço AnyDesk parou. Tentando reiniciar...'
+              Start-Service AnyDesk -ErrorAction SilentlyContinue
             }
             Write-Host "[$count] Sessão ativa - $(Get-Date) - ID $env:ANYDESK_ID"
             qwinsta 2>$null | ForEach-Object { Write-Host "[SESSÕES] $_" }
@@ -98,12 +119,14 @@ jobs:
         if: always()
         shell: pwsh
         run: |
+          Write-Host '##### Serviço AnyDesk #####'
+          Get-Service -Name AnyDesk -ErrorAction SilentlyContinue | Format-List Name, Status
           Write-Host '##### Processos do AnyDesk #####'
           Get-Process -Name AnyDesk -ErrorAction SilentlyContinue | Format-Table Name, Id, StartTime -AutoSize
           Write-Host '##### Sessões do Windows #####'
           qwinsta 2>$null
           Write-Host '##### Logs do AnyDesk #####'
-          $logDir = Join-Path $env:APPDATA 'AnyDesk'
+          $logDir = Join-Path $env:ProgramData 'AnyDesk'
           if (Test-Path $logDir) {
             Get-ChildItem $logDir -Filter *.trace -Recurse -ErrorAction SilentlyContinue |
               ForEach-Object { Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 50 }
