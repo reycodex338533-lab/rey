@@ -1,0 +1,161 @@
+name: Desktop Windows (RDP + ngrok)
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Número da instância (1-10)'
+        required: false
+        default: '1'
+        type: string
+
+jobs:
+  deploy-windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verificar secret do ngrok
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+            throw 'Configure o secret NGROK_AUTHTOKEN no repositório.'
+          }
+
+      - name: Gerar usuário e senha aleatórios
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function New-RandomString([string]$chars, [int]$length) {
+            -join (1..$length | ForEach-Object {
+              $chars[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($chars.Length)]
+            })
+          }
+          $user = 'u' + (New-RandomString 'abcdefghijkmnpqrstuvwxyz23456789' 8)
+          # Garante letra maiúscula, minúscula, número e símbolo (exigência do Windows)
+          $pass = 'Aa1!' + (New-RandomString 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789' 20)
+
+          "RDP_USER=$user" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Usuário gerado: $user"
+
+      - name: Habilitar RDP e criar usuário
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Start-Service TermService
+
+          $secure = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USER
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USER
+          Write-Host "Usuário $env:RDP_USER criado e liberado para RDP."
+
+      - name: Iniciar túnel TCP público (ngrok)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'ngrok'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $zip = Join-Path $dir 'ngrok.zip'
+          Invoke-WebRequest -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' -OutFile $zip -UseBasicParsing
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $ngrok = Join-Path $dir 'ngrok.exe'
+
+          & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao configurar o authtoken do ngrok.' }
+
+          $log = Join-Path $env:RUNNER_TEMP 'ngrok.log'
+          $errLog = Join-Path $env:RUNNER_TEMP 'ngrok-err.log'
+          Start-Process -FilePath $ngrok -ArgumentList @('tcp', '3389', '--log=stdout') `
+            -RedirectStandardOutput $log -RedirectStandardError $errLog -WindowStyle Hidden
+
+          $publicUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $api = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels'
+              $publicUrl = $api.tunnels | Where-Object { $_.proto -eq 'tcp' } |
+                Select-Object -First 1 -ExpandProperty public_url
+              if ($publicUrl) { break }
+            } catch { }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $publicUrl) {
+            Write-Host '--- ngrok.log ---'; Get-Content $log -ErrorAction SilentlyContinue
+            Write-Host '--- ngrok-err.log ---'; Get-Content $errLog -ErrorAction SilentlyContinue
+            throw 'O ngrok não criou o túnel TCP.'
+          }
+
+          $address = $publicUrl -replace '^tcp://', ''
+          "RDP_ADDRESS=$address" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Túnel criado: $address"
+
+      - name: Mostrar credenciais de acesso
+        shell: pwsh
+        run: |
+          Write-Host '=============================================='
+          Write-Host " DESKTOP WINDOWS PRONTO - Instância #${{ github.event.inputs.instance_number || '1' }}"
+          Write-Host '=============================================='
+          Write-Host " Endereço RDP : $env:RDP_ADDRESS"
+          Write-Host " Usuário      : $env:RDP_USER"
+          Write-Host " Senha        : $env:RDP_PASS"
+          Write-Host '----------------------------------------------'
+          Write-Host ' No celular: app Microsoft Remote Desktop'
+          Write-Host ' Adicione um PC com o endereço acima.'
+          Write-Host '=============================================='
+
+      - name: Manter sessão ativa e exibir logs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'ngrok.log'
+          $lastLine = 0
+          Write-Host '##### LOGS EM TEMPO REAL (ngrok, RDP, sessões) #####'
+
+          while ($true) {
+            if (-not (Get-Process -Name ngrok -ErrorAction SilentlyContinue)) {
+              Write-Host '::error::ngrok parou'
+              Get-Content $log -ErrorAction SilentlyContinue
+              exit 1
+            }
+            if ((Get-Service TermService).Status -ne 'Running') {
+              Write-Host '::error::Serviço TermService (RDP) parou'
+              exit 1
+            }
+
+            if (Test-Path $log) {
+              $lines = @(Get-Content $log)
+              if ($lines.Count -gt $lastLine) {
+                $lines[$lastLine..($lines.Count - 1)] | ForEach-Object { Write-Host "[NGROK] $_" }
+                $lastLine = $lines.Count
+              }
+            }
+
+            Write-Host "--- Sessão ativa - $(Get-Date) - $env:RDP_ADDRESS ---"
+            qwinsta 2>$null | ForEach-Object { Write-Host "[SESSÕES] $_" }
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Diagnóstico final (executa mesmo se algo falhar)
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host '##### ngrok.log #####'
+          Get-Content (Join-Path $env:RUNNER_TEMP 'ngrok.log') -ErrorAction SilentlyContinue
+          Write-Host '##### ngrok-err.log #####'
+          Get-Content (Join-Path $env:RUNNER_TEMP 'ngrok-err.log') -ErrorAction SilentlyContinue
+          Write-Host '##### Serviço TermService #####'
+          Get-Service TermService -ErrorAction SilentlyContinue | Format-List Name, Status
+          Write-Host '##### Eventos de conexão RDP #####'
+          try {
+            Get-WinEvent -LogName 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational' -MaxEvents 30 |
+              Format-Table TimeCreated, Id, Message -Wrap
+          } catch { Write-Host 'Nenhum evento encontrado.' }
