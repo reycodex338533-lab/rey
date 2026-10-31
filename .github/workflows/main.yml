@@ -23,7 +23,6 @@ jobs:
           $pass = -join (1..20 | ForEach-Object {
             $chars[[System.Security.Cryptography.RandomNumberGenerator]::GetInt32($chars.Length)]
           })
-          Write-Host "::add-mask::$pass"
           "ANYDESK_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Instalar AnyDesk (com serviço)
@@ -85,7 +84,6 @@ jobs:
           }
 
           if (-not $id) { throw 'Não foi possível obter o ID do AnyDesk.' }
-          Write-Host "::add-mask::$id"
           "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host 'ID obtido.'
 
