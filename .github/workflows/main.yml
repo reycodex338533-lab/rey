@@ -25,6 +25,36 @@ jobs:
           })
           "ANYDESK_PASS=$pass" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Remover programas indesejados
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # Firefox e R já vêm instalados na imagem do windows-latest, por isso são removidos aqui
+          foreach ($pkg in @('firefox', 'r.project')) {
+            Write-Host "Removendo $pkg..."
+            choco uninstall $pkg -y --no-progress --all-versions 2>&1 | Out-Null
+            Write-Host "$pkg: código $LASTEXITCODE"
+          }
+
+          # Unity: procura nos registros de desinstalação e tenta remover
+          $paths = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $apps = Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'Unity*' -and $_.UninstallString }
+          foreach ($app in $apps) {
+            Write-Host "Desinstalando $($app.DisplayName)..."
+            $cmd = $app.UninstallString
+            if ($cmd -match 'msiexec') {
+              $cmd = $cmd -replace '/I', '/X'
+              $cmd += ' /qn /norestart'
+            }
+            Start-Process cmd -ArgumentList "/c $cmd" -Wait -ErrorAction SilentlyContinue
+          }
+          if (-not $apps) { Write-Host 'Unity não encontrado.' }
+
       - name: Instalar AnyDesk (com serviço)
         shell: pwsh
         run: |
@@ -86,6 +116,46 @@ jobs:
           if (-not $id) { throw 'Não foi possível obter o ID do AnyDesk.' }
           "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host 'ID obtido.'
+
+      - name: Aplicar plano de fundo e tema escuro
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # Baixa a imagem do plano de fundo
+          $url = 'https://i.postimg.cc/LsZjR2SG/file-000000001cac820ebd5bfb81ab3dde7b.png'
+          $dir = Join-Path $env:USERPROFILE 'Pictures'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $dest = Join-Path $dir 'plano-de-fundo.png'
+          Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+
+          # Define o plano de fundo (estilo "Preencher")
+          $desktop = 'HKCU:\Control Panel\Desktop'
+          Set-ItemProperty $desktop -Name Wallpaper -Value $dest
+          Set-ItemProperty $desktop -Name WallpaperStyle -Value '10'
+          Set-ItemProperty $desktop -Name TileWallpaper -Value '0'
+
+          Add-Type @'
+          using System.Runtime.InteropServices;
+          public class Wallpaper {
+            [DllImport("user32.dll", CharSet = CharSet.Auto)]
+            public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+          }
+          '@
+          # 0x14 = SPI_SETDESKWALLPAPER, 0x03 = atualizar o registro e notificar
+          [Wallpaper]::SystemParametersInfo(0x14, 0, $dest, 0x03) | Out-Null
+
+          # Tema escuro para aplicativos e para o sistema (barra de tarefas, menu iniciar)
+          $personalize = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+          New-Item -Path $personalize -Force | Out-Null
+          Set-ItemProperty $personalize -Name AppsUseLightTheme -Value 0 -Type DWord
+          Set-ItemProperty $personalize -Name SystemUsesLightTheme -Value 0 -Type DWord
+
+          # Reinicia o Explorer para aplicar o tema escuro
+          Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          Start-Process explorer.exe
+          Write-Host 'Plano de fundo e tema escuro aplicados.'
 
       - name: Evitar suspensão
         shell: pwsh
