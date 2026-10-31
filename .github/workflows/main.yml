@@ -45,7 +45,6 @@ jobs:
           Write-Host "AnyDesk em: $exe"
           "ANYDESK_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          # Garante que o serviço está rodando
           $svc = Get-Service -Name AnyDesk -ErrorAction SilentlyContinue
           if ($svc -and $svc.Status -ne 'Running') { Start-Service AnyDesk }
           Start-Sleep -Seconds 5
@@ -54,30 +53,41 @@ jobs:
       - name: Definir senha de acesso
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $out = $env:ANYDESK_PASS | & $env:ANYDESK_EXE --set-password 2>&1
+          $exe = $env:ANYDESK_EXE
+          Write-Host "Caminho do AnyDesk: $exe"
+          Write-Host "Existe: $(Test-Path $exe)"
+          if (-not (Test-Path $exe)) { throw 'AnyDesk.exe não encontrado no caminho salvo.' }
+
+          # A senha usa só letras e números, então é segura no comando do cmd
+          $out = cmd /c "echo $env:ANYDESK_PASS| `"$exe`" --set-password 2>&1"
           $code = $LASTEXITCODE
           Write-Host "Saída do --set-password: $out"
           Write-Host "Código de saída: $code"
-          if ($code -ne 0) { throw "Falha ao definir a senha do AnyDesk (código $code). Saída: $out" }
+          if ($code -ne 0) { throw "Falha ao definir a senha (código $code). Saída: $out" }
           Write-Host 'Senha definida.'
 
       - name: Obter ID do AnyDesk
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $id = $null
-          for ($i = 0; $i -lt 30; $i++) {
-            $out = (& $env:ANYDESK_EXE --get-id 2>&1 | Out-String).Trim()
+          $trace = 'C:\ProgramData\AnyDesk\ad_svc.trace'
+
+          for ($i = 0; $i -lt 30 -and -not $id; $i++) {
+            $out = cmd /c "`"$env:ANYDESK_EXE`" --get-id 2>&1" | Out-String
             if ($out -match '(\d{9,10})') { $id = $Matches[1]; break }
+
+            if (Test-Path $trace) {
+              $m = Select-String -Path $trace -Pattern 'Client-ID: (\d{9,10})' | Select-Object -Last 1
+              if ($m) { $id = $m.Matches[0].Groups[1].Value; break }
+            }
             Start-Sleep -Seconds 3
           }
-          if (-not $id) {
-            Write-Host "Última saída do --get-id: $out"
-            throw 'Não foi possível obter o ID do AnyDesk.'
-          }
+
+          if (-not $id) { throw 'Não foi possível obter o ID do AnyDesk.' }
           Write-Host "::add-mask::$id"
           "ANYDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host 'ID obtido.'
 
       - name: Evitar suspensão
         shell: pwsh
