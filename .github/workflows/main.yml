@@ -32,9 +32,9 @@ jobs:
 
           # Firefox e R já vêm instalados na imagem do windows-latest, por isso são removidos aqui
           foreach ($pkg in @('firefox', 'r.project')) {
-            Write-Host "Removendo $pkg..."
+            Write-Host "Removendo ${pkg}..."
             choco uninstall $pkg -y --no-progress --all-versions 2>&1 | Out-Null
-            Write-Host "$pkg: código $LASTEXITCODE"
+            Write-Host "${pkg}: código $LASTEXITCODE"
           }
 
           # Unity: procura nos registros de desinstalação e tenta remover
